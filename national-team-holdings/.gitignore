@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data_cache/
+.cache/
+*.png
+*.html
+!examples/*.png
+!examples/*.html
+.DS_Store
