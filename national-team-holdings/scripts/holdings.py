@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""国家队持仓代理指标（非官方）。
+"""国家队持仓多口径对照（非官方）。
 
-代理占比 = Σ(四只沪深300 ETF 份额 × 单位净值) / 沪深300流通市值 × 100%
+默认同时给出：
+1) 代理占比 = Σ(四只沪深300 ETF 份额 × 单位净值) / 沪深300流通市值 × 100%
+2/3) 日份额变动与净申赎 ≈ Δ份额 × 单位净值
+6) 半年报/年报十大持有人中的汇金/证金/社保等披露持仓
 
 这是可复用的命令行实现，不是看板服务。公开数据失败时会标明数据源与原因，
-不会编造数字。
+不会编造数字。任一序列都不是官方国家队持仓。
 """
 from __future__ import annotations
 
@@ -26,10 +29,18 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-DISCLAIMER = "代理指标，非官方国家队/汇金持仓。"
+DISCLAIMER = (
+    "代理指标，非官方国家队/汇金持仓。以下为多口径对照，请自行判断，任一序列都不是官方持仓。"
+)
 TZ = ZoneInfo("Asia/Shanghai")
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CACHE = SKILL_ROOT / "data_cache"
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+import holders as holders_mod  # noqa: E402
+import netflow as netflow_mod  # noqa: E402
 
 ETF_LIST = (
     {"code": "510300", "name": "华泰柏瑞沪深300ETF", "market": "SH"},
@@ -231,13 +242,22 @@ def fetch_nav_history(code: str, pages: int, cache: Path, quiet: bool) -> list[d
     return out
 
 
-def load_nav(code: str, pages: int, cache: Path, max_age_hours: float, quiet: bool) -> list[dict]:
+def load_nav(
+    code: str,
+    pages: int,
+    cache: Path,
+    max_age_hours: float,
+    quiet: bool,
+    min_date: str | None = None,
+) -> list[dict]:
     path = cache / f"nav_{code}.json"
-    if _cache_fresh(path, max_age_hours):
-        data = _read_json_cache(path)
-        if data:
+    data = _read_json_cache(path) if path.exists() else None
+    if data and _cache_fresh(path, max_age_hours):
+        oldest = min((str(r.get("date") or "9999") for r in data), default="9999")
+        if not min_date or oldest <= min_date:
             log(f"[NAV] {code} 使用缓存 {len(data)} 条", quiet)
             return data
+        log(f"[NAV] {code} 缓存最早 {oldest}，覆盖不到 {min_date}，补拉净值", quiet)
     return fetch_nav_history(code, pages, cache, quiet)
 
 
@@ -710,6 +730,8 @@ def build_history(
             "历史序列为空，请检查份额/净值接口。" + hint,
         )
 
+    # 先在含 lookback 的序列上算 Δ份额，再裁剪，以便窗口首日也有前值。
+    series = netflow_mod.attach_share_deltas(series, ETF_CODES)
     series = crop_series(series, start, end)
     if not series:
         raise DataSourceError("序列组装", f"窗口 {start}~{end} 裁剪后没有数据点")
@@ -768,6 +790,29 @@ def build_history(
         "unit_note": "上交所 TOT_VOL 为万份，已 ×10000 转为份；深交所报表已是份。",
         "etfs": list(latest["etfs"].values()),
         "warnings": warnings,
+        "methods": {
+            "proxy_ratio": build_proxy_method_block(
+                {
+                    "ratio": latest["ratio"],
+                    "data_date": latest["date"],
+                    "etf_mv_sum_yi": latest["etf_mv_sum_yi"],
+                    "csi300_circ_mv_yi": latest["csi300_circ_mv_yi"],
+                    "csi300_close": latest["csi300_close"],
+                    "range": {
+                        "high": {"date": high["date"], "ratio": high["ratio"]},
+                        "low": {"date": low["date"], "ratio": low["ratio"]},
+                    },
+                    "etfs": list(latest["etfs"].values()),
+                    "period": {
+                        "preset": period_label,
+                        "label": PERIOD_LABELS.get(period_label, period_label),
+                        "start": series[0]["date"],
+                        "end": latest["date"],
+                    },
+                }
+            ),
+            "net_creation": netflow_mod.summarize_netflow(series, ETF_CODES, ETF_LIST),
+        },
         "endpoints": {
             "nav": "https://api.fund.eastmoney.com/f10/lsjz?fundCode={code}",
             "sse_shares": (
@@ -777,9 +822,14 @@ def build_history(
             "szse_shares": "https://www.szse.cn/api/report/ShowReport CATALOGID=scsj_fund_jjgm (份)",
             "csi300_kline": "sina / tencent / eastmoney push2his secid=1.000300",
             "csi300_mv": "qt.gtimg.cn/q=sh000300 或 eastmoney f117/f116",
+            "holders_sina": (
+                "https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/"
+                "CaihuiFundInfoService.getFundHolder"
+            ),
+            "holders_stockstar": "https://fund.stockstar.com/funds/f10/fundholder_{code}.html",
         },
     }
-    return {"summary": summary, "series": series}
+    return {"summary": summary, "series": series, "navs": navs}
 
 
 def slim_series(series: list[dict]) -> list[dict]:
@@ -792,11 +842,45 @@ def slim_series(series: list[dict]) -> list[dict]:
             "csi300_circ_mv_yi": p["csi300_circ_mv_yi"],
             "csi300_close": p["csi300_close"],
         }
+        if p.get("net_flow_sum_yi") is not None:
+            row["net_flow_sum_yi"] = round(float(p["net_flow_sum_yi"]), 4)
+        if p.get("delta_shares_sum_yi") is not None:
+            row["delta_shares_sum_yi"] = round(float(p["delta_shares_sum_yi"]), 4)
+        etfs = p.get("etfs") or {}
         for code in ETF_CODES:
-            etf = p["etfs"][code]
-            row[f"mv_{code}_yi"] = round(etf["market_value_yi"], 2)
+            etf = etfs.get(code) or {}
+            if etf.get("market_value_yi") is not None:
+                row[f"mv_{code}_yi"] = round(float(etf["market_value_yi"]), 2)
+            if etf.get("delta_shares_yi") is not None:
+                row[f"delta_shares_{code}_yi"] = round(float(etf["delta_shares_yi"]), 4)
+            if etf.get("net_flow_yi") is not None:
+                row[f"net_flow_{code}_yi"] = round(float(etf["net_flow_yi"]), 4)
         out.append(row)
     return out
+
+
+def build_proxy_method_block(summary: dict) -> dict:
+    return {
+        "id": "1",
+        "title": "沪深300ETF 规模代理占比",
+        "data_date": summary.get("data_date"),
+        "accuracy_note": (
+            "日频代理：四只沪深300 ETF 合计市值 / 沪深300流通市值。"
+            "无法识别买方，不是官方国家队持仓。历史流通市值为点位缩放近似。"
+        ),
+        "formula": (
+            "代理占比 = Σ(基金份额 × 单位净值) / 沪深300流通市值 × 100%；"
+            "四只ETF：510300/510330/159919/510310"
+        ),
+        "ratio": summary.get("ratio"),
+        "etf_mv_sum_yi": summary.get("etf_mv_sum_yi"),
+        "csi300_circ_mv_yi": summary.get("csi300_circ_mv_yi"),
+        "csi300_close": summary.get("csi300_close"),
+        "range": summary.get("range"),
+        "etfs": summary.get("etfs"),
+        "period": summary.get("period"),
+        "ok": summary.get("ratio") is not None,
+    }
 
 
 # --------------- 导出 / 绘图 ---------------
@@ -837,6 +921,51 @@ def write_html(path: Path, summary: dict, series: list[dict]) -> None:
         )
     warn_html = "".join(f"<li>{esc(w)}</li>" for w in summary.get("warnings") or [])
     label = esc(str(summary["period"].get("label") or ""))
+    methods = summary.get("methods") or {}
+    net = methods.get("net_creation") or {}
+    hold = methods.get("disclosed_holders") or {}
+    extra_kpis = []
+    if net.get("latest_day_net_flow_yi") is not None:
+        extra_kpis.append(
+            f"<div class=\"kpi\">最新一日净申赎<b>{net['latest_day_net_flow_yi']:.2f} 亿</b>"
+            f"{esc(str(net.get('data_date') or ''))}</div>"
+        )
+    if net.get("period_net_flow_yi") is not None:
+        extra_kpis.append(
+            f"<div class=\"kpi\">区间累计净申赎<b>{net['period_net_flow_yi']:.2f} 亿</b></div>"
+        )
+    if hold.get("total_matched_mv_yi") not in (None, 0, 0.0) and hold.get("ok"):
+        extra_kpis.append(
+            f"<div class=\"kpi\">披露国家队相关持仓市值<b>{hold['total_matched_mv_yi']:.2f} 亿</b>"
+            f"{esc(str(hold.get('report_date') or '各ETF最新一期'))}</div>"
+        )
+    extra_kpi_html = "".join(extra_kpis)
+    holder_rows = []
+    for h in hold.get("matched_holders") or []:
+        mv = h.get("market_value_yi")
+        pct = h.get("pct_of_fund")
+        holder_rows.append(
+            "<tr>"
+            f"<td>{esc(str(h.get('code')))}</td>"
+            f"<td>{esc(str(h.get('holder_name')))}</td>"
+            f"<td>{float(h.get('shares_yi') or 0):.2f}</td>"
+            f"<td>{'' if pct is None else f'{pct:.2f}'}</td>"
+            f"<td>{'' if mv is None else f'{mv:.2f}'}</td>"
+            f"<td>{esc(str(h.get('report_date') or ''))}</td>"
+            "</tr>"
+        )
+    holder_table = ""
+    if holder_rows:
+        holder_table = (
+            "<h2>方法6 定期报告匹配持有人（滞后，非日频）</h2>"
+            "<table><thead><tr><th>ETF</th><th>持有人</th><th>份额(亿份)</th>"
+            "<th>占基金%</th><th>市值估算(亿)</th><th>报告期</th></tr></thead><tbody>"
+            + "".join(holder_rows)
+            + "</tbody></table>"
+        )
+    elif hold:
+        note = "；".join(hold.get("warnings") or ["无匹配持有人或数据源失败"])
+        holder_table = f"<h2>方法6 定期报告十大持有人</h2><p>{esc(note)}</p>"
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -865,6 +994,7 @@ def write_html(path: Path, summary: dict, series: list[dict]) -> None:
     <div class="kpi">区间最低<b>{summary['range']['low']['ratio']:.4f}%</b>{esc(summary['range']['low']['date'])}</div>
     <div class="kpi">ETF 合计市值<b>{summary['etf_mv_sum_yi']:.2f} 亿</b></div>
     <div class="kpi">沪深300流通市值<b>{summary['csi300_circ_mv_yi']:.2f} 亿</b>点位缩放近似</div>
+    {extra_kpi_html}
   </div>
   <canvas id="chart" height="110"></canvas>
   <h2>分项（份额 × 单位净值）</h2>
@@ -874,6 +1004,7 @@ def write_html(path: Path, summary: dict, series: list[dict]) -> None:
       {''.join(etf_rows)}
     </tbody>
   </table>
+  {holder_table}
   <h2>说明</h2>
   <ul>{warn_html}</ul>
   <footer>默认技能只输出数据；本页仅在传入 --html / --web 时生成。公式：{esc(summary.get('formula') or '')}</footer>
@@ -910,44 +1041,210 @@ def write_html(path: Path, summary: dict, series: list[dict]) -> None:
     path.write_text(html, encoding="utf-8")
 
 
+def _fmt_yi(value: float | None, digits: int = 2) -> str:
+    if value is None:
+        return "（无）"
+    return f"{value:.{digits}f}"
+
+
 def format_text(summary: dict) -> str:
+    methods = summary.get("methods") or {}
+    proxy = methods.get("proxy_ratio") or build_proxy_method_block(summary)
+    net = methods.get("net_creation") or {}
+    hold = methods.get("disclosed_holders") or {}
+    period = summary.get("period") or {}
+
     lines = [
         f"【免责声明】{DISCLAIMER}",
+        "北向资金 / 沪深股通 / 香港中央结算不是国家队，未计入方法6。",
         "",
-        f"区间: {summary['period'].get('label', '')}  "
-        f"{summary['period']['start']} ~ {summary['period']['end']}  "
-        f"（{summary['period']['points']} 个交易日）",
-        f"最新数据日: {summary['data_date']}",
-        f"最新代理占比: {summary['ratio']:.4f}%",
-        f"区间最高: {summary['range']['high']['ratio']:.4f}%（{summary['range']['high']['date']}）",
-        f"区间最低: {summary['range']['low']['ratio']:.4f}%（{summary['range']['low']['date']}）",
-        f"四只 ETF 合计市值: {summary['etf_mv_sum_yi']:.2f} 亿元",
-        f"沪深300流通市值: {summary['csi300_circ_mv_yi']:.2f} 亿元（历史点为点位缩放近似）",
-        f"沪深300收盘: {summary['csi300_close']}",
-        f"流通市值来源: {summary['circ_mv_source']}",
+        f"日频窗口: {period.get('label', '')}  "
+        f"{period.get('start')} ~ {period.get('end')}  "
+        f"（{period.get('points')} 个交易日）",
+        "方法6 报告期独立选择（默认各 ETF 已披露的最新中报/年报），不受 --period 裁剪。",
         "",
-        "分项（份额×单位净值）:",
+        "======== 方法1  代理占比（ETF 市值 / 沪深300流通市值）========",
+        f"数据日: {proxy.get('data_date') or summary.get('data_date')}",
+        f"准确度: {proxy.get('accuracy_note')}",
+        f"最新代理占比: {float(proxy.get('ratio') or summary.get('ratio') or 0):.4f}%",
+        f"四只 ETF 合计市值: {_fmt_yi(proxy.get('etf_mv_sum_yi') if proxy.get('etf_mv_sum_yi') is not None else summary.get('etf_mv_sum_yi'))} 亿元",
+        f"沪深300流通市值: {_fmt_yi(proxy.get('csi300_circ_mv_yi') if proxy.get('csi300_circ_mv_yi') is not None else summary.get('csi300_circ_mv_yi'))} 亿元（历史点为点位缩放近似）",
     ]
-    for e in summary["etfs"]:
+    rng = proxy.get("range") or summary.get("range") or {}
+    high = rng.get("high") or {}
+    low = rng.get("low") or {}
+    if high.get("ratio") is not None:
+        lines.append(f"窗口最高: {high['ratio']:.4f}%（{high.get('date')}）")
+    if low.get("ratio") is not None:
+        lines.append(f"窗口最低: {low['ratio']:.4f}%（{low.get('date')}）")
+    if summary.get("csi300_close") is not None:
+        lines.append(f"沪深300收盘: {summary['csi300_close']}")
+    if summary.get("circ_mv_source"):
+        lines.append(f"流通市值来源: {summary['circ_mv_source']}")
+    lines.append("分项（份额×单位净值）:")
+    for e in summary.get("etfs") or []:
         lines.append(
-            f"  {e['code']} {e['name']}: 份额 {e['shares_yi']:.2f} 亿份 × "
-            f"单位净值 {e['dwjz']} → 市值 {e['market_value_yi']:.2f} 亿"
-            f"（净值日 {e['nav_date']} / 份额日 {e['shares_date']}）"
+            f"  {e['code']} {e.get('name', '')}: 份额 {e.get('shares_yi', 0):.2f} 亿份 × "
+            f"单位净值 {e.get('dwjz')} → 市值 {e.get('market_value_yi', 0):.2f} 亿"
+            f"（净值日 {e.get('nav_date')} / 份额日 {e.get('shares_date')}）"
         )
-    if summary.get("warnings"):
+
+    lines.extend(["", "======== 方法2/3  份额变动与净申赎 ========"])
+    if net.get("ok") and net.get("data_date"):
+        lines.append(f"数据日: {net.get('data_date')}")
+        lines.append(f"准确度: {net.get('accuracy_note')}")
+        lines.append(
+            f"最新一日净申赎: {_fmt_yi(net.get('latest_day_net_flow_yi'), 4)} 亿元"
+            f"（Δ份额 {_fmt_yi(net.get('latest_day_delta_shares_yi'), 4)} 亿份）"
+        )
+        lines.append(
+            f"窗口累计净申赎: {_fmt_yi(net.get('period_net_flow_yi'), 4)} 亿元"
+            f"（Δ份额 {_fmt_yi(net.get('period_delta_shares_yi'), 4)} 亿份）"
+        )
+        lines.append("份额趋势（剔除价格噪音）:")
+        for e in net.get("by_etf") or []:
+            lines.append(
+                f"  {e['code']} {e.get('name', '')}: "
+                f"{_fmt_yi(e.get('shares_start_yi'))} → {_fmt_yi(e.get('shares_end_yi'))} 亿份，"
+                f"区间 Δ {_fmt_yi(e.get('period_delta_shares_yi'), 4)} 亿份，"
+                f"累计净申赎 {_fmt_yi(e.get('period_net_flow_yi'), 4)} 亿元"
+                f"（最新一日 {_fmt_yi(e.get('latest_day_net_flow_yi'), 4)} 亿）"
+            )
+    else:
+        lines.append("未能计算净申赎（序列不足或份额缺失）。未编造数字。")
+
+    lines.extend(["", "======== 方法6  定期报告十大持有人（披露持仓）========"])
+    if hold.get("ok"):
+        rd = hold.get("report_date") or "、".join(hold.get("report_dates") or []) or "各 ETF 最新一期"
+        lines.append(f"报告期: {rd}")
+        lines.append(f"准确度: {hold.get('accuracy_note')}")
+        src = hold.get("source") or ""
+        if src:
+            lines.append(f"来源: {src}  {hold.get('source_api') or ''}")
+        if hold.get("comparable"):
+            lines.append(
+                f"匹配持有人合计: {_fmt_yi(hold.get('total_matched_shares_yi'))} 亿份，"
+                f"市值估算 {_fmt_yi(hold.get('total_matched_mv_yi'))} 亿元（同一报告期，可加总对照）"
+            )
+        else:
+            lines.append(
+                f"匹配持有人合计（各 ETF 最新一期，报告期可能不同）: "
+                f"{_fmt_yi(hold.get('total_matched_shares_yi'))} 亿份，"
+                f"市值估算 {_fmt_yi(hold.get('total_matched_mv_yi'))} 亿元"
+            )
+        for etf in hold.get("by_etf") or []:
+            if not etf.get("ok"):
+                lines.append(f"  {etf.get('code')} {etf.get('name', '')}: 失败 {etf.get('error')}")
+                continue
+            lines.append(
+                f"  {etf.get('code')} {etf.get('name', '')}  报告期 {etf.get('report_date')}  "
+                f"匹配 {_fmt_yi(etf.get('matched_shares_yi'))} 亿份 / "
+                f"{etf.get('matched_pct_of_fund')}% / "
+                f"市值 {_fmt_yi(etf.get('matched_market_value_yi'))} 亿元"
+            )
+            for h in etf.get("matched_holders") or []:
+                pct = h.get("pct_of_fund")
+                pct_s = "（无%）" if pct is None else f"{pct:.2f}%"
+                lines.append(
+                    f"    - {h.get('holder_name')}: {float(h.get('shares') or 0)/1e8:.4f} 亿份，"
+                    f"{pct_s}，市值估算 {_fmt_yi(h.get('market_value_yi'))} 亿元"
+                    f"（净值日 {h.get('nav_date')} / {h.get('nav_basis')}）"
+                )
+            if not etf.get("matched_holders"):
+                lines.append("    （该期前十名中未匹配到汇金/证金/社保等主体）")
+    else:
+        lines.append("未能获取十大持有人。未编造数字。")
+        for w in hold.get("warnings") or []:
+            lines.append(f"  - {w}")
+
+    all_warn = list(summary.get("warnings") or [])
+    if all_warn:
         lines.append("")
         lines.append("说明:")
-        for w in summary["warnings"]:
+        for w in all_warn:
             lines.append(f"  - {w}")
     lines.append("")
-    lines.append("不做: 不声称这是官方国家队/汇金持仓，不覆盖其它沪深300ETF或股票直投。")
+    lines.append(
+        "不做: 不声称任一口径是官方国家队/汇金持仓；不把北向/股通算作国家队；"
+        "接口失败时不编数字。"
+    )
     return "\n".join(lines)
 
 
 def build_export_payload(summary: dict, series: list[dict]) -> dict:
     payload = dict(summary)
     payload["series"] = slim_series(series)
+    methods = dict(payload.get("methods") or {})
+    if "proxy_ratio" not in methods:
+        methods["proxy_ratio"] = build_proxy_method_block(summary)
+    payload["methods"] = methods
     return payload
+
+
+def attach_disclosed_holders(
+    summary: dict,
+    navs: dict[str, list[dict]],
+    cache: Path,
+    *,
+    refresh: bool,
+    quiet: bool,
+    report_date: str | None,
+    holders_basket: str,
+) -> None:
+    """方法6 失败时只记警告，不让整次运行失败、不编数字。"""
+    # 方法6 要用报告期末净值；默认日频窗口的净值页数往往到不了半年前。
+    min_nav_date = (today_sh() - timedelta(days=420)).isoformat()
+    if report_date:
+        min_nav_date = min(min_nav_date, report_date)
+    nav_age = 0.0 if refresh else 6.0
+    holder_pages = min(60, max(24, 420 // 20 + 4))
+    for meta in holders_mod.etf_basket(holders_basket):
+        code = meta["code"]
+        try:
+            navs[code] = load_nav(
+                code,
+                holder_pages,
+                cache,
+                nav_age,
+                quiet,
+                min_date=min_nav_date,
+            )
+        except Exception as e:
+            log(f"[NAV] {code} 方法6 净值不足: {e}", quiet)
+
+    try:
+        section = holders_mod.build_holder_section(
+            etf_list=holders_mod.etf_basket(holders_basket),
+            navs=navs,
+            cache=cache,
+            refresh=refresh,
+            quiet=quiet,
+            requested_report_date=report_date,
+            log=log,
+        )
+    except Exception as e:
+        section = {
+            "id": "6",
+            "title": "定期报告十大持有人（披露持仓）",
+            "report_date": None,
+            "data_date": None,
+            "accuracy_note": holders_mod.ACCURACY_NOTE,
+            "ok": False,
+            "comparable": False,
+            "matched_holders": [],
+            "by_etf": [],
+            "total_matched_mv_yi": None,
+            "warnings": [str(e), "十大持有人数据源失败，未编造数字。"],
+        }
+        log(f"[持有人] 失败: {e}", quiet)
+
+    methods = dict(summary.get("methods") or {})
+    if "proxy_ratio" not in methods:
+        methods["proxy_ratio"] = build_proxy_method_block(summary)
+    methods["disclosed_holders"] = section
+    summary["methods"] = methods
+    if section.get("warnings"):
+        summary.setdefault("warnings", []).extend(section["warnings"])
 
 
 @dataclass
@@ -963,32 +1260,44 @@ class CliArgs:
     json_path: Path | None
     html: Path | None
     quiet: bool
+    report_date: str | None
+    holders_basket: str
 
 
 def parse_args(argv: list[str] | None) -> CliArgs:
     p = argparse.ArgumentParser(
         description=(
-            "国家队持仓代理指标（非官方）。"
+            "国家队持仓多口径对照（非官方）：代理占比 + 净申赎 + 定期报告十大持有人。"
             "默认只输出终端摘要或 JSON/CSV 数据，不生成图表或网页。"
         ),
         epilog=(
-            "时间窗口：--period 1m|3m|6m|1y 缩短或拉长；也可用 --start/--end。"
-            "摘要、CSV、JSON 与可选网页均按该窗口裁剪。"
+            "--period / --start / --end 只裁剪日频序列（方法1与方法2/3）。"
+            "方法6 报告期默认取各 ETF 已披露的最新中报/年报，或用 --report-date 指定。"
         ),
     )
     p.add_argument(
         "--period",
         choices=["1m", "3m", "6m", "1y", "ytd"],
         default="1m",
-        help="预设窗口：1m=最近1个月，3m=3个月，6m=半年，1y=1年，ytd=年初至今。默认 1m",
+        help="日频窗口：1m=最近1个月，3m=3个月，6m=半年，1y=1年，ytd=年初至今。默认 1m。不影响方法6报告期",
     )
-    p.add_argument("--start", help="自定义起始日 YYYY-MM-DD（传入则视为自定义窗口）")
+    p.add_argument("--start", help="自定义起始日 YYYY-MM-DD（传入则视为自定义窗口；仅日频序列）")
     p.add_argument("--end", help="自定义结束日 YYYY-MM-DD，默认今天（上海时区）；可与 --period 合用")
+    p.add_argument(
+        "--report-date",
+        help="方法6 指定半年报/年报报告期 YYYY-MM-DD（如 2025-12-31）。默认各 ETF 已披露的最新一期，与 --period 独立",
+    )
+    p.add_argument(
+        "--holders-basket",
+        choices=["csi300", "wide"],
+        default="csi300",
+        help="方法6 持有人篮子：csi300=四只沪深300ETF（默认）；wide=再加上常见汇金重仓宽基ETF",
+    )
     p.add_argument("--cache-dir", default=str(DEFAULT_CACHE), help="缓存目录，默认技能目录下 data_cache/")
-    p.add_argument("--refresh", action="store_true", help="忽略净值缓存时效，重新拉取净值与行情")
+    p.add_argument("--refresh", action="store_true", help="忽略缓存时效，重新拉取净值、行情与持有人披露")
     p.add_argument("--clear-cache", action="store_true", help="开始前清空缓存目录")
     p.add_argument("--format", dest="fmt", choices=["text", "json"], default="text", help="stdout 格式，默认 text")
-    p.add_argument("--csv", nargs="?", const="holdings_proxy.csv", default=None, help="导出 CSV（只含所选窗口）")
+    p.add_argument("--csv", nargs="?", const="holdings_proxy.csv", default=None, help="导出 CSV（只含所选窗口日频序列）")
     p.add_argument("--json", dest="json_path", nargs="?", const="holdings_proxy.json", default=None, help="导出 JSON")
     p.add_argument(
         "--html",
@@ -1013,6 +1322,8 @@ def parse_args(argv: list[str] | None) -> CliArgs:
         json_path=Path(ns.json_path) if ns.json_path else None,
         html=Path(ns.html) if ns.html else None,
         quiet=ns.quiet,
+        report_date=ns.report_date,
+        holders_basket=ns.holders_basket,
     )
 
 
@@ -1049,6 +1360,16 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = data["summary"]
     series = data["series"]
+    navs = dict(data.get("navs") or {})
+    attach_disclosed_holders(
+        summary,
+        navs,
+        args.cache_dir,
+        refresh=args.refresh,
+        quiet=args.quiet,
+        report_date=args.report_date,
+        holders_basket=args.holders_basket,
+    )
     payload = build_export_payload(summary, series)
 
     if args.csv:
