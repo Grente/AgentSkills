@@ -11,3 +11,4 @@ data_cache/
 *.html
 !**/examples/*.png
 !**/examples/*.html
+!**/tests/fixtures/*.html
