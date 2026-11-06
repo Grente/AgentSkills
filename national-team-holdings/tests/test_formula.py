@@ -67,6 +67,52 @@ class WindowTests(unittest.TestCase):
         self.assertEqual([p["date"] for p in cropped], ["2026-01-10", "2026-01-11", "2026-01-12"])
 
 
+class NavCacheTests(unittest.TestCase):
+    def test_load_nav_refetches_when_cache_does_not_cover_min_date(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td)
+            (cache / "nav_510300.json").write_text(
+                json.dumps([{"date": "2026-10-01", "dwjz": 4.0}]),
+                encoding="utf-8",
+            )
+            called = {"n": 0}
+
+            def fake_fetch(code, pages, cache_dir, quiet):
+                called["n"] += 1
+                return [
+                    {"date": "2025-06-30", "dwjz": 3.5},
+                    {"date": "2026-10-01", "dwjz": 4.0},
+                ]
+
+            orig = holdings.fetch_nav_history
+            holdings.fetch_nav_history = fake_fetch
+            try:
+                rows = holdings.load_nav("510300", 10, cache, 24.0, True, min_date="2025-12-31")
+            finally:
+                holdings.fetch_nav_history = orig
+            self.assertEqual(called["n"], 1)
+            self.assertEqual(rows[0]["date"], "2025-06-30")
+
+    def test_load_nav_keeps_cache_when_old_enough(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td)
+            (cache / "nav_510300.json").write_text(
+                json.dumps([{"date": "2025-06-30", "dwjz": 3.5}]),
+                encoding="utf-8",
+            )
+
+            def boom(*_a, **_k):
+                raise AssertionError("should use cache")
+
+            orig = holdings.fetch_nav_history
+            holdings.fetch_nav_history = boom
+            try:
+                rows = holdings.load_nav("510300", 10, cache, 24.0, True, min_date="2025-12-31")
+            finally:
+                holdings.fetch_nav_history = orig
+            self.assertEqual(rows[0]["date"], "2025-06-30")
+
+
 class CliDefaultTests(unittest.TestCase):
     def test_default_has_no_html(self):
         args = holdings.parse_args(["--period", "3m"])
@@ -74,6 +120,16 @@ class CliDefaultTests(unittest.TestCase):
         self.assertIsNone(args.csv)
         self.assertIsNone(args.json_path)
         self.assertEqual(args.period, "3m")
+        self.assertIsNone(args.report_date)
+        self.assertEqual(args.holders_basket, "csi300")
+
+    def test_report_date_independent_of_period(self):
+        args = holdings.parse_args(
+            ["--period", "1m", "--report-date", "2025-06-30", "--holders-basket", "wide"]
+        )
+        self.assertEqual(args.period, "1m")
+        self.assertEqual(args.report_date, "2025-06-30")
+        self.assertEqual(args.holders_basket, "wide")
 
     def test_html_and_web_aliases(self):
         a = holdings.parse_args(["--html"])

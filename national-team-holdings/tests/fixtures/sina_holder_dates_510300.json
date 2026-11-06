@@ -1,0 +1,11 @@
+{
+  "result": {
+    "status": { "code": 0 },
+    "data": [
+      { "PUBLISHDATE": "2025-12-31" },
+      { "PUBLISHDATE": "2025-06-30" },
+      { "PUBLISHDATE": "2024-12-31" },
+      { "PUBLISHDATE": "2024-06-30" }
+    ]
+  }
+}
